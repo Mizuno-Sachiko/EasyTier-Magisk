@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*-*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      CORE_VERSION: 2.7.0
+      CORE_SHA256: f2e8a306d21cceadb253c55854b4b96b3b60c623db79bac8471019225746d6b2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare version and official EasyTier package
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          match = re.fullmatch(
+              r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)-([1-9][0-9]?)",
+              os.environ["RELEASE_TAG"],
+          )
+          if match is None:
+              raise ValueError(
+                  "Use vMAJOR.MINOR.PATCH-REVISION; minor, patch and revision must be below 100"
+              )
+          core_version = ".".join(match.groups()[:3])
+          if core_version != os.environ["CORE_VERSION"]:
+              raise ValueError("The tag must match the pinned EasyTier core version")
+          major, minor, patch, revision = map(int, match.groups())
+          # Keep the versionCode scheme used by previously installed modules.
+          version_code = major * 1000000 + minor * 10000 + patch * 100 + revision
+          if version_code > 2147483647:
+              raise ValueError("versionCode exceeds the supported integer range")
+          with Path(os.environ["GITHUB_ENV"]).open("a") as environment:
+              environment.write(f"VERSION={match[0][1:]}\nVERSION_CODE={version_code}\n")
+
+          url = f"https://github.com/EasyTier/EasyTier/releases/download/v{core_version}/Easytier-Magisk-v{core_version}.zip"
+          with urllib.request.urlopen(url, timeout=60) as source:
+              package = source.read()
+          if hashlib.sha256(package).hexdigest() != os.environ["CORE_SHA256"]:
+              raise ValueError("Official EasyTier package SHA-256 mismatch")
+          with (Path(os.environ["RUNNER_TEMP"]) / "upstream.zip").open("xb") as output:
+              output.write(package)
+          PY
+
+      - name: Build module
+        shell: bash
+        run: |
+          python3 build.py \
+            --source "$RUNNER_TEMP/upstream.zip" --sha256 "$CORE_SHA256" \
+            --version "$VERSION" --version-code "$VERSION_CODE" \
+            --output "dist/easytier-magisk-$VERSION.zip"
+          git for-each-ref --format='%(contents)' "refs/tags/$RELEASE_TAG" > dist/changelog.md
+          cd dist
+          sha256sum "easytier-magisk-$VERSION.zip" > "easytier-magisk-$VERSION.zip.sha256"
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "dist/easytier-magisk-$VERSION.zip" "dist/easytier-magisk-$VERSION.zip.sha256" \
+            dist/update.json dist/changelog.md \
+            --verify-tag --latest --title "EasyTier for Magisk $VERSION" --notes-from-tag
